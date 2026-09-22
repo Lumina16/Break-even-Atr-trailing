@@ -87,49 +87,49 @@ enum ENUM_ENTRY_BLOCK
 //| Inputs                                                           |
 //+------------------------------------------------------------------+
 input group "M5 REGIME"
-input int    M5PivotSize = 2;
+input int    M5PivotSize = 2;              // Confirmed M5 swing pivot size (bars each side)
 
 input group "M1 ENTRY"
-input int    ATRPeriod              = 14;
-input double PullbackATRMin         = 0.40;
-input int    PullbackReferenceBars  = 5;
+input int    ATRPeriod              = 14;  // M1 ATR period
+input double PullbackATRMin         = 0.40;// Pullback distance required (x ATR)
+input int    PullbackReferenceBars  = 5;   // Completed M1 bars defining reference extreme
 input int    ReclaimLookbackBars    = 3;   // Legacy V1.01 compatibility; unused by V1.02 turn-candle trigger
-input int    SetupExpiryMinutes     = 15;
-input int    ReentryCooldownMinutes = 2;
+input int    SetupExpiryMinutes     = 15;  // Armed setup lifetime (minutes)
+input int    ReentryCooldownMinutes = 2;   // Cooldown before identical-direction re-arm (minutes)
 
 input group "TRADE MANAGEMENT"
-input double InitialStopATRBuffer = 0.20;
-input double MinInitialRiskATR    = 0.40;
-input double MaxInitialRiskATR    = 1.00;
-input double BreakEvenTriggerATR  = 0.60;
-input double BreakEvenLockATR     = 0.00;
-input double TrailStartATR        = 1.00;
-input double TrailATRMult         = 1.00;
+input double InitialStopATRBuffer = 0.20; // Extra SL buffer beyond pullback extreme (x ATR)
+input double MinInitialRiskATR    = 0.40; // V1.01: min TOTAL entry->SL risk (x ATR), inclusive
+input double MaxInitialRiskATR    = 1.00; // V1.01: max TOTAL entry->SL risk (x ATR), inclusive
+input double BreakEvenTriggerATR  = 0.60; // Favorable move (x ATR@entry) to arm break-even
+input double BreakEvenLockATR     = 0.00; // BE lock offset beyond entry (x ATR@entry)
+input double TrailStartATR        = 1.00; // Favorable move (x ATR@entry) to arm ATR trailing
+input double TrailATRMult         = 1.00; // Trailing distance (x completed M1 ATR)
 
 input group "VOLATILITY"
-input int    VolatilityLookback   = 50;
-input double VolatilitySpikeLimit = 1.50;
+input int    VolatilityLookback   = 50;    // Completed M1 ATR values averaged
+input double VolatilitySpikeLimit = 1.50;  // Block entry if ATR > average * limit
 
 input group "MONEY / EXECUTION"
-input double LotSize           = 0.01;
-input long   MagicNumber       = 20260922;
-input int    MaxOpenTrades     = 3;
-input int    MaxSpreadPoints   = 350;
-input int    MaxSlippagePoints = 30;
+input double LotSize           = 0.01;     // Fixed lot size (no martingale/grid ever)
+input long   MagicNumber       = 20260922; // EA magic number
+input int    MaxOpenTrades     = 3;        // Max simultaneous EA positions (symbol+magic)
+input int    MaxSpreadPoints   = 350;      // Max allowed spread (points)
+input int    MaxSlippagePoints = 30;       // Max deviation/slippage (points)
 
 input group "SESSION"
-input int TradingStartHour = 7;
-input int TradingEndHour   = 20;
+input int TradingStartHour = 7;            // Session start hour (server time)
+input int TradingEndHour   = 20;           // Session end hour (server time)
 
 input group "PANEL"
-input bool ShowPanel       = true;
-input int  PanelRefreshMs  = 300;
+input bool ShowPanel       = true;         // Show compact dashboard
+input int  PanelRefreshMs  = 300;          // Panel refresh interval (ms)
 
 input group "DEBUG"
-input bool DebugMode  = false;
-input bool DebugM5    = false;
-input bool DebugM1    = false;
-input bool DebugTrade = false;
+input bool DebugMode  = false;              // Master debug switch (enables all)
+input bool DebugM5    = false;              // M5 pivot/structure debug logs
+input bool DebugM1    = false;              // M1 setup debug logs
+input bool DebugTrade = false;              // Trade flow debug logs
 
 //+------------------------------------------------------------------+
 //| Validated / clamped effective inputs (inputs are never modified) |
