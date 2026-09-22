@@ -40,10 +40,12 @@
 // blocks the trade; the structural stop is never moved to pass.
 // V1.03: after a same-direction trade fully closes, ELAPSED TIME ALONE
 // can never re-enable that direction. The direction is rearm-locked
-// until the SAME pullback predicate that arms setups is observed FALSE
-// (old episode cleared) and then freshly FALSE -> TRUE (new episode).
-// ReentryCooldownMinutes (default 2) is only a final anti-noise gate
-// measured from the actual close time; it never creates an entry.
+// until the RAW regime-independent price/ATR pullback condition is
+// observed FALSE (old episode cleared) and then freshly FALSE -> TRUE
+// (new episode). An M5 regime change alone never satisfies the
+// clear/fresh cycle. ReentryCooldownMinutes (default 2) is only a final
+// anti-noise gate measured from the actual close time; it never creates
+// an entry.
 //==================================================================
 
 //+------------------------------------------------------------------+
@@ -859,14 +861,18 @@ void InvalidateTurnCandle()
    g_setup.crossArmed          = false;
   }
 
-// --- V1.03 pullback qualification predicates -------------------------------
-// The SINGLE source of truth for "pullback qualified right now", used BOTH
-// by normal setup arming and by the rearm clear/fresh cycle. The formula is
-// the untouched V1.02 logic: completed-bar reference extreme, live Bid
-// (BUY) / Ask (SELL) measurement, ATR-normalized threshold, regime gate.
-bool IsBuyPullbackQualifiedNow(const MqlTick &tick)
+// --- V1.03 pullback condition predicates ------------------------------------
+// CORRECTION 1: two cleanly separated concepts.
+//   1) RAW price/ATR pullback condition (below): regime-independent. The rearm
+//      clear/fresh cycle uses ONLY this, so an M5 regime change alone can never
+//      set sawClearedState, unlock a direction, or create a fresh transition.
+//   2) Normal setup qualification: proper M5 regime AND the raw condition
+//      (enforced at the arming call site before ArmSetup()).
+// The raw formula is the untouched V1.02 logic: completed-bar reference
+// extreme, ATR-normalized threshold, live Bid (BUY) / Ask (SELL) measurement.
+bool IsBuyRawPullbackCondition(const MqlTick &tick)
   {
-   if(g_m5.regime != REGIME_BULLISH) return false;
+   // NO M5 regime check here by design.
    if(g_pullbackRefHigh <= 0.0) return false;
    if(g_atrPrev <= 0.0) return false;
    double req  = g_atrPrev * EffPullbackATRMin;
@@ -874,9 +880,9 @@ bool IsBuyPullbackQualifiedNow(const MqlTick &tick)
    return (dist >= req);
   }
 
-bool IsSellPullbackQualifiedNow(const MqlTick &tick)
+bool IsSellRawPullbackCondition(const MqlTick &tick)
   {
-   if(g_m5.regime != REGIME_BEARISH) return false;
+   // NO M5 regime check here by design.
    if(g_pullbackRefLow <= 0.0) return false;
    if(g_atrPrev <= 0.0) return false;
    double req  = g_atrPrev * EffPullbackATRMin;
@@ -908,8 +914,10 @@ string RearmStateText(const SRearmState &rs)
 void ActivateRearmLock(const ENUM_TRADE_DIR dir, const datetime closeTime,
                        const long exitPositionId, const MqlTick &tick)
   {
-   bool currentQualified = (dir == DIR_BUY) ? IsBuyPullbackQualifiedNow(tick)
-                                            : IsSellPullbackQualifiedNow(tick);
+   // CORRECTION 1: record the RAW price/ATR pullback condition only — the M5
+   // regime must never influence the post-trade clear/fresh cycle.
+   bool currentQualified = (dir == DIR_BUY) ? IsBuyRawPullbackCondition(tick)
+                                            : IsSellRawPullbackCondition(tick);
    if(dir == DIR_BUY)
      {
       g_rearmBuy.locked                    = true;
@@ -936,14 +944,18 @@ void ActivateRearmLock(const ENUM_TRADE_DIR dir, const datetime closeTime,
   }
 
 // Per-tick rearm transition processing (transitions only; no per-tick spam).
-// LOCKED + predicate FALSE        -> old pullback episode cleared (WAIT_NEW_PULLBACK)
+// CORRECTION 1: transitions use ONLY the regime-independent RAW pullback
+// condition. LOCKED + raw FALSE   -> old pullback episode cleared (WAIT_NEW_PULLBACK)
 // LOCKED + FALSE -> TRUE          -> NEW pullback episode: direction unlocked
+// An M5 regime change alone therefore never clears or unlocks anything.
+// A fresh raw pullback on a non-matching regime is recognized here, but no
+// setup can arm until the proper M5 permission exists (arming call site).
 // The timer is never involved in these transitions.
 void UpdateRearmState(const MqlTick &tick)
   {
    if(g_rearmBuy.locked)
      {
-      bool current = IsBuyPullbackQualifiedNow(tick);
+      bool current = IsBuyRawPullbackCondition(tick);
       if(!g_rearmBuy.sawClearedState)
         {
          if(!current)
@@ -965,7 +977,7 @@ void UpdateRearmState(const MqlTick &tick)
      }
    if(g_rearmSell.locked)
      {
-      bool current = IsSellPullbackQualifiedNow(tick);
+      bool current = IsSellRawPullbackCondition(tick);
       if(!g_rearmSell.sawClearedState)
         {
          if(!current)
@@ -988,17 +1000,21 @@ void UpdateRearmState(const MqlTick &tick)
   }
 
 // One-time deterministic restart restoration: scans the last 24h of deals for
-// this symbol + MagicNumber. If this EA's most recent fully-closed trade(s)
-// left a same-direction rearm logically active, the lock is restored with the
-// current predicate observation. Partial exits (position still open), other
-// symbols/magics and entry deals are ignored. No per-tick history access.
+// this symbol + MagicNumber and restores a post-trade rearm lock from the MOST
+// RECENT fully-closed managed trade per direction (greatest actual final close
+// time — CORRECTION 3, never deal-iteration order). Candidate position ids are
+// deduplicated when several exit deals belong to the same position. Open or
+// partially closed positions, other symbols/magics and entry deals are ignored.
+// No per-tick history access and no historical pullback/trigger replay.
 void RestoreRearmStateFromHistory()
   {
    if(!HistorySelect(TimeCurrent() - 86400, TimeCurrent())) return;
    int total = HistoryDealsTotal();
-   long     candPosId[];
-   datetime candClose[];
-   int      candCount = 0;
+   long     uniqPosId[];
+   datetime uniqLastExit[];
+   int      uniqCount = 0;
+   // pass 1: unique candidate position ids from exit deals, keeping the
+   // greatest exit-deal time per position (dedup across multiple exit deals)
    for(int i = 0; i < total; i++)
      {
       ulong dealTicket = HistoryDealGetTicket(i);
@@ -1010,24 +1026,34 @@ void RestoreRearmStateFromHistory()
       long posId = (long)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
       if(posId <= 0) continue;
       datetime dealTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
-      int n = candCount;
-      ArrayResize(candPosId, n + 1);
-      ArrayResize(candClose, n + 1);
-      candPosId[n] = posId;
-      candClose[n] = dealTime;
-      candCount++;
+      int found = -1;
+      for(int k = 0; k < uniqCount; k++)
+         if(uniqPosId[k] == posId) { found = k; break; }
+      if(found < 0)
+        {
+         int n = uniqCount;
+         ArrayResize(uniqPosId, n + 1);
+         ArrayResize(uniqLastExit, n + 1);
+         uniqPosId[n]    = posId;
+         uniqLastExit[n] = dealTime;
+         uniqCount++;
+        }
+      else if(dealTime > uniqLastExit[found])
+         uniqLastExit[found] = dealTime;
      }
-   bool   buyFound  = false;
-   bool   sellFound = false;
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick)) return;
-   for(int j = 0; j < candCount && !(buyFound && sellFound); j++)
+   // pass 2: per direction, select the fully closed position with the greatest
+   // actual final close time
+   long     bestBuyId = 0, bestSellId = 0;
+   datetime bestBuyClose = 0, bestSellClose = 0;
+   for(int j = 0; j < uniqCount; j++)
      {
-      if(IsClosedPositionProcessed(candPosId[j])) continue;
-      if(IsPositionOpen(candPosId[j])) continue;          // partial exit: not a full close yet
-      if(!HistorySelectByPosition(candPosId[j])) continue;
+      if(IsClosedPositionProcessed(uniqPosId[j])) continue;
+      if(IsPositionOpen(uniqPosId[j])) continue;          // partial exit: not a full close yet
+      if(!HistorySelectByPosition(uniqPosId[j])) continue;
       long     inType    = 0;
-      datetime closeTime = candClose[j];
+      datetime closeTime = uniqLastExit[j];
       int deals = HistoryDealsTotal();
       for(int d = 0; d < deals; d++)
         {
@@ -1043,14 +1069,29 @@ void RestoreRearmStateFromHistory()
            }
         }
       if(inType != DEAL_TYPE_BUY && inType != DEAL_TYPE_SELL) continue;
-      bool isBuy = (inType == DEAL_TYPE_BUY);
-      if((isBuy && buyFound) || (!isBuy && sellFound)) continue;
-      ActivateRearmLock(isBuy ? DIR_BUY : DIR_SELL, closeTime, candPosId[j], tick);
-      MarkClosedPositionProcessed(candPosId[j]);           // never double-process this exit
-      if(isBuy) buyFound = true; else sellFound = true;
+      if(inType == DEAL_TYPE_BUY)
+        {
+         if(closeTime > bestBuyClose) { bestBuyClose = closeTime; bestBuyId = uniqPosId[j]; }
+        }
+      else
+        {
+         if(closeTime > bestSellClose) { bestSellClose = closeTime; bestSellId = uniqPosId[j]; }
+        }
+     }
+   // pass 3: restore from the most recent closed trade per direction only
+   if(bestBuyId != 0)
+     {
+      ActivateRearmLock(DIR_BUY, bestBuyClose, bestBuyId, tick);
+      MarkClosedPositionProcessed(bestBuyId);            // never double-process this exit
       if(DebugM1Enabled())
-         PrintFormat("[REARM][%s] Post-trade rearm state restored from history",
-                     DirLabel(isBuy ? DIR_BUY : DIR_SELL));
+         Print("[REARM][BUY] Post-trade rearm state restored from history (most recent close)");
+     }
+   if(bestSellId != 0)
+     {
+      ActivateRearmLock(DIR_SELL, bestSellClose, bestSellId, tick);
+      MarkClosedPositionProcessed(bestSellId);
+      if(DebugM1Enabled())
+         Print("[REARM][SELL] Post-trade rearm state restored from history (most recent close)");
      }
   }
 
@@ -1106,10 +1147,11 @@ bool ArmSetup(const ENUM_TRADE_DIR dir, const MqlTick &tick)
   }
 
 // WAIT_PULLBACK scanning: live retreat from the cached completed-bar extreme.
-// V1.03: arming uses the SAME predicate as the rearm cycle, and a direction
-// that is rearm-locked after a trade close cannot arm at all. The safety
-// cooldown is NOT applied here — a fresh setup may build while the cooldown
-// runs; the cooldown blocks final execution instead (never creates it).
+// V1.03: normal setup qualification = proper M5 regime permission AND the RAW
+// pullback condition (Correction 1). A direction that is rearm-locked after a
+// trade close cannot arm at all. The safety cooldown is NOT applied here — a
+// fresh setup may build while the cooldown runs; the cooldown blocks final
+// execution instead (never creates it).
 void TryArmPullbackSetup(const MqlTick &tick)
   {
    if(g_setup.active) return;
@@ -1118,13 +1160,13 @@ void TryArmPullbackSetup(const MqlTick &tick)
    if(g_m5.regime == REGIME_BULLISH)
      {
       if(g_rearmBuy.locked) return;           // V1.03: fresh pullback episode mandatory
-      if(IsBuyPullbackQualifiedNow(tick))
+      if(IsBuyRawPullbackCondition(tick))     // M5 permission already checked above
          ArmSetup(DIR_BUY, tick);
      }
    else if(g_m5.regime == REGIME_BEARISH)
      {
       if(g_rearmSell.locked) return;          // V1.03: fresh pullback episode mandatory
-      if(IsSellPullbackQualifiedNow(tick))
+      if(IsSellRawPullbackCondition(tick))    // M5 permission already checked above
          ArmSetup(DIR_SELL, tick);
      }
   }
@@ -1715,7 +1757,9 @@ bool OpenSell(const MqlTick &tick)
   }
 
 // One frozen-trigger break = one entry episode. Executed, blocked, or failed:
-// the episode is always retired and cooldown starts.
+// the episode is always retired. V1.03: the safety cooldown is anchored ONLY
+// to the actual full close of a managed position — retiring an entry episode
+// never starts or extends any cooldown.
 void AttemptEntry(const MqlTick &tick)
   {
    g_stats.entryAttempts++;
@@ -1935,8 +1979,11 @@ void ManagePositions(const MqlTick &tick)
      {
       if(!PositionSelectByTicket(g_tracks[i].ticket))
         {
-         ProcessClosedPosition(g_tracks[i].positionId); // fallback if transaction was missed
-         RemoveTrack(i);
+         // fallback if the transaction event was missed; CORRECTION 4: keep
+         // the track while close processing must be retried (e.g. transient
+         // missing tick) so the rearm lock can never be silently bypassed
+         if(ProcessClosedPosition(g_tracks[i].positionId))
+            RemoveTrack(i);
          continue;
         }
       ManageOnePosition(g_tracks[i], tick);
@@ -1945,14 +1992,19 @@ void ManagePositions(const MqlTick &tick)
 
 //+------------------------------------------------------------------+
 //| Realized trade statistics from completed deal history            |
+//| + V1.03 same-direction rearm activation on full close            |
 //+------------------------------------------------------------------+
-void ProcessClosedPosition(const long positionId)
+// Returns true when the close has been fully processed (stats counted,
+// rearm decided, position id marked). Returns false only when processing
+// must be retried on a later tick (CORRECTION 4: a transient missing tick
+// must never permanently bypass the same-direction rearm lock).
+bool ProcessClosedPosition(const long positionId)
   {
-   if(positionId <= 0) return;
-   if(IsClosedPositionProcessed(positionId)) return;
-   if(!HistorySelectByPosition(positionId)) return;
+   if(positionId <= 0) return true;
+   if(IsClosedPositionProcessed(positionId)) return true;
+   if(!HistorySelectByPosition(positionId)) return true;
    int dealCount = HistoryDealsTotal();
-   if(dealCount <= 0) return;
+   if(dealCount <= 0) return true;
 
    double   net = 0.0;
    datetime firstIn = 0;
@@ -1989,20 +2041,39 @@ void ProcessClosedPosition(const long positionId)
         }
      }
 
-   MarkClosedPositionProcessed(positionId);
-   if(!ours) return; // not opened by this EA
+   if(!ours)
+     {
+      MarkClosedPositionProcessed(positionId);
+      return true; // not opened by this EA
+     }
 
    // V1.03: full close of a managed position on this symbol -> same-direction
    // rearm lock. Direction comes from the position's opening deal type (inType),
    // never from the closing deal's side. Partial closes never reach this point
-   // (the position would still be open). Processed exactly once per position id.
+   // (the position would still be open).
+   // CORRECTION 4: the position is marked processed ONLY after the rearm lock
+   // has actually been initialized (or no lockable direction exists). If the
+   // tick is transiently unavailable, nothing is marked and no statistics are
+   // counted yet — the caller retries safely on a later tick, so stats can
+   // never be double-counted (the success path runs exactly once).
+   bool rearmInitialized = false;
    if(inType == DEAL_TYPE_BUY || inType == DEAL_TYPE_SELL)
      {
       MqlTick tick;
       if(SymbolInfoTick(_Symbol, tick))
+        {
          ActivateRearmLock((inType == DEAL_TYPE_BUY) ? DIR_BUY : DIR_SELL,
                            (lastOut > 0 ? lastOut : TimeCurrent()), positionId, tick);
+         rearmInitialized = true;
+        }
      }
+   else
+      rearmInitialized = true; // defensive: nothing lockable for this close
+
+   if(!rearmInitialized)
+      return false;            // retry later: not marked, stats not yet counted
+
+   MarkClosedPositionProcessed(positionId);
 
    g_stats.tradesTotal++;
    if(inType == DEAL_TYPE_BUY)       g_stats.tradesBuy++;
@@ -2027,6 +2098,7 @@ void ProcessClosedPosition(const long positionId)
       g_stats.holdSecondsTotal += (double)(lastOut - firstIn);
       g_stats.holdCount++;
      }
+   return true;
   }
 
 void OnTradeTransaction(const MqlTradeTransaction &trans,
@@ -2714,10 +2786,6 @@ void OnTick()
    if(!SymbolInfoTick(_Symbol, tick)) return;
    if(tick.bid <= 0.0 || tick.ask <= 0.0) return;
 
-   // V1.03: per-direction rearm transitions (old-pullback clear detection,
-   // fresh FALSE -> TRUE qualification). Transitions only; no per-tick logs.
-   UpdateRearmState(tick);
-
    // 2. new M5 bar: causal pivots -> structure -> regime -> setup invalidation
    if(IsNewBar(PERIOD_M5, g_lastM5BarTime))
      {
@@ -2730,17 +2798,22 @@ void OnTick()
    if(IsNewBar(PERIOD_M1, g_lastM1BarTime))
       ProcessNewM1Bar(tick);
 
-   // 4. live M1 pullback / turn-candle frozen-trigger engine
+   // 4. V1.03 rearm transitions: regime-independent RAW pullback condition,
+   // evaluated AFTER the M5/M1 caches above were refreshed so clear/fresh
+   // detection always sees the current completed-bar ATR/reference values.
+   UpdateRearmState(tick);
+
+   // 5. live M1 pullback / turn-candle frozen-trigger engine
    ProcessLiveSetup(tick);
 
-   // 5. open-position management: break-even -> ATR trailing
+   // 6. open-position management: break-even -> ATR trailing
    ManagePositions(tick);
 
-   // remember previous live prices (fresh-cross audit / logging)
+   // 7. remember previous live prices (fresh-cross audit / logging)
    g_prevBid = tick.bid;
    g_prevAsk = tick.ask;
 
-   // 6. throttled panel update
+   // 8. throttled panel update
    UpdateEquityDrawdown();
    UpdatePanelThrottled(tick);
   }
